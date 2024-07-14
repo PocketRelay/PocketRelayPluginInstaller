@@ -42,7 +42,6 @@ bytes = "1.4.0"
 # Iced GUI framework variant
 [dependencies.iced]
 version = "0.10"
-default-features = false
 features = ["image", "tokio"]
 
 [profile.release]
