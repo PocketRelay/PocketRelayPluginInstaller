@@ -57,7 +57,7 @@ args = [
     "${SIGN_FILE}",
     "/p",
     "${SIGN_PASSWORD}",
-    ".release/binaries/pocket-relay-client.exe",
+    ".release/binaries/pocket-relay-plugin-installer.exe",
 ]
 
 [tasks.sign-windows.condition]
@@ -80,13 +80,13 @@ args = ["build", "--target", "x86_64-unknown-linux-gnu", "--release"]
 # Copy the linux build to the releases folder
 [tasks.copy-build-linux-windows]
 script_runner = "@shell"
-script = "cp target/x86_64-unknown-linux-gnu/release/pocket-relay-client .release/binaries/pocket-relay-client"
+script = "cp target/x86_64-unknown-linux-gnu/release/pocket-relay-plugin-installer .release/binaries/pocket-relay-plugin-installer"
 dependencies = ["create-release-dir"]
 
 # Copy the Windows build to the releases folder
 [tasks.copy-build-windows-windows]
 script_runner = "@shell"
-script = "cp target/release/pocket-relay-client.exe .release/binaries/pocket-relay-client.exe"
+script = "cp target/release/pocket-relay-plugin-installer.exe .release/binaries/pocket-relay-plugin-installer.exe"
 dependencies = ["create-release-dir"]
 
 
@@ -106,13 +106,13 @@ args = ["build", "--release"]
 # Copy the linux build to the releases folder
 [tasks.copy-build-linux-linux]
 script_runner = "@shell"
-script = "cp target/release/pocket-relay-client .release/binaries/pocket-relay-client-linux"
+script = "cp target/release/pocket-relay-plugin-installer .release/binaries/pocket-relay-plugin-installer-linux"
 dependencies = ["create-release-dir"]
 
 # Copy the Windows build to the releases folder
 [tasks.copy-build-windows-linux]
 script_runner = "@shell"
-script = "cp target/x86_64-pc-windows-gnu/release/pocket-relay-client.exe .release/binaries/pocket-relay-client.exe"
+script = "cp target/x86_64-pc-windows-gnu/release/pocket-relay-plugin-installer.exe .release/binaries/pocket-relay-plugin-installer.exe"
 dependencies = ["create-release-dir"]
 
 
