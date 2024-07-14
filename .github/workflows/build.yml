@@ -14,10 +14,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         include:
           - os: ubuntu-latest
-            file: pocket-relay-client
+            file: pocket-relay-plugin-installer
             file_name: Ubuntu Build
           - os: windows-latest
-            file: pocket-relay-client.exe
+            file: pocket-relay-plugin-installer.exe
             file_name: Windows Build
     runs-on: ${{ matrix.os }}
 
