@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
 
 /// The window size
-const WINDOW_SIZE: (u32, u32) = (500, 130);
+const WINDOW_SIZE: (u32, u32) = (500, 140);
 const EXPANDED_WINDOW_SIZE: (u32, u32) = (500, 200);
 
 /// Initializes the user interface
