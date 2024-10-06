@@ -257,12 +257,12 @@ async fn read_game_state(exe_path: &Path) -> anyhow::Result<GameState> {
 
 /// Obtains the plugin details for the current available releases
 async fn get_plugin_details() -> anyhow::Result<PluginDetails> {
-    let mut options = Vec::new();
-
     let release = get_latest_plugin_release().await?;
     let beta_release = get_latest_beta_plugin_release().await?;
 
-    options.push(ReleaseType::Stable(release.clone()));
+    let mut options = Vec::new();
+
+    options.push(ReleaseType::Stable(release));
     if let Some(beta_release) = beta_release {
         options.push(ReleaseType::Beta(beta_release));
     }
@@ -274,7 +274,7 @@ async fn get_plugin_details() -> anyhow::Result<PluginDetails> {
 
     let release_type_state = combo_box::State::<ReleaseType>::new(options);
 
-    Ok::<_, anyhow::Error>(PluginDetails {
+    Ok(PluginDetails {
         release_type_state,
         selected,
     })
@@ -282,13 +282,9 @@ async fn get_plugin_details() -> anyhow::Result<PluginDetails> {
 
 /// Creates a task that will load and update the plugin details
 fn plugin_details_task() -> Task<AppMessage> {
-    Task::perform(get_plugin_details(), |result| {
-        let result = result.map_err(|err| {
-            error!("failed to load plugin details: {err:?}");
-            format!("{err:?}")
-        });
-        AppMessage::PluginDetails(PluginDetailsMessage::Loaded(result))
-    })
+    Task::perform(get_plugin_details(), map_error_string)
+        .map(PluginDetailsMessage::Loaded)
+        .map(AppMessage::PluginDetails)
 }
 
 async fn pick_game_state() -> anyhow::Result<Option<GameState>> {
@@ -626,10 +622,8 @@ impl App {
     fn update_game(&mut self, msg: GameMessage) -> Task<GameMessage> {
         match msg {
             GameMessage::PickGamePath => {
-                return Task::perform(pick_game_state(), |result| {
-                    let result = result.map_err(|err| format!("{err:?}"));
-                    GameMessage::PickedGameResult(result)
-                });
+                return Task::perform(pick_game_state(), map_error_string)
+                    .map(GameMessage::PickedGameResult);
             }
             GameMessage::PickedGameResult(result) => {
                 match result {
@@ -681,18 +675,14 @@ impl App {
             PatchMessage::Add => {
                 state.alter_patch_state = AlterPatchState::Loading;
 
-                return Task::perform(apply_patch(state.path.to_path_buf()), |result| {
-                    let result = result.map_err(|err| format!("{err:?}"));
-                    PatchMessage::Added(result)
-                });
+                return Task::perform(apply_patch(state.path.to_path_buf()), map_error_string)
+                    .map(PatchMessage::Added);
             }
             PatchMessage::Remove => {
                 state.alter_patch_state = AlterPatchState::Loading;
 
-                return Task::perform(remove_patch(state.path.to_path_buf()), |result| {
-                    let result = result.map_err(|err| format!("{err:?}"));
-                    PatchMessage::Removed(result)
-                });
+                return Task::perform(remove_patch(state.path.to_path_buf()), map_error_string)
+                    .map(PatchMessage::Removed);
             }
             PatchMessage::Added(result) => {
                 if let Err(err) = result {
@@ -739,20 +729,16 @@ impl App {
 
                 state.alter_plugin_state = AlterPluginState::Loading;
 
-                return Task::perform(apply_plugin(path, release), |result| {
-                    let result = result.map_err(|err| format!("{err:?}"));
-                    PluginMessage::Added(result)
-                });
+                return Task::perform(apply_plugin(path, release), map_error_string)
+                    .map(PluginMessage::Added);
             }
             PluginMessage::Remove => {
                 let path = state.path.to_path_buf();
 
                 state.alter_plugin_state = AlterPluginState::Loading;
 
-                return Task::perform(remove_plugin(path), |result| {
-                    let result = result.map_err(|err| format!("{err:?}"));
-                    PluginMessage::Removed(result)
-                });
+                return Task::perform(remove_plugin(path), map_error_string)
+                    .map(PluginMessage::Removed);
             }
             PluginMessage::Added(result) => {
                 if let Err(err) = result {
@@ -787,11 +773,18 @@ impl App {
             PluginDetailsMessage::Loaded(result) => {
                 self.plugin_details_state = match result {
                     Ok(value) => PluginDetailsState::Ready(value),
-                    Err(err) => PluginDetailsState::Error(err),
+                    Err(err) => {
+                        error!("failed to load plugin details: {err:?}");
+                        PluginDetailsState::Error(err)
+                    }
                 }
             }
         }
 
         Task::none()
     }
+}
+
+fn map_error_string<V>(result: anyhow::Result<V>) -> Result<V, String> {
+    result.map_err(|err| format!("{err:?}"))
 }
