@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 /// Structure for the required portions of github releases
 #[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct GitHubRelease {
     /// The URL for viewing the release in the browser
     pub html_url: String,
@@ -16,6 +17,8 @@ pub struct GitHubRelease {
     pub name: String,
     /// The date & time the release was published
     pub published_at: String,
+    /// Whether the version is a pre-release
+    pub prerelease: bool,
     /// The release assets
     pub assets: Vec<GitHubReleaseAsset>,
 }
@@ -42,6 +45,28 @@ pub async fn get_latest_release(
         "https://api.github.com/repos/{}/releases/latest",
         repository
     );
+
+    debug!("{url}");
+
+    http_client
+        .get(url)
+        .header(header::ACCEPT, "application/json")
+        .send()
+        .await?
+        .json()
+        .await
+}
+
+/// Attempts to obtain the latest release from github
+///
+/// ## Arguments
+/// * `http_client` - The HTTP client to make the request with
+/// * `repository`  - The repository to get the latest release for (e.g "PocketRelay/Client")
+pub async fn get_releases(
+    http_client: &reqwest::Client,
+    repository: &str,
+) -> Result<Vec<GitHubRelease>, reqwest::Error> {
+    let url = format!("https://api.github.com/repos/{}/releases", repository);
 
     debug!("{url}");
 

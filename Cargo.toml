@@ -41,7 +41,7 @@ bytes = "1.4.0"
 
 # Iced GUI framework variant
 [dependencies.iced]
-version = "0.10"
+version = "0.13"
 features = ["image", "tokio"]
 
 [profile.release]

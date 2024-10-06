@@ -1,28 +1,33 @@
 use crate::{
     bink::{apply_patch, is_patched, remove_patch},
     github::GitHubRelease,
-    plugin::{apply_plugin, get_latest_plugin_release, remove_plugin},
-    ui::{show_error, show_info, ICON_BYTES, WINDOW_TITLE},
+    plugin::{
+        apply_plugin, get_latest_beta_plugin_release, get_latest_plugin_release, remove_plugin,
+    },
 };
 use anyhow::Context;
 use iced::{
-    executor,
     theme::Palette,
-    widget::{button, column, combo_box, container, row, text, Button, Column, Text},
-    window::{self, icon, resize},
-    Application, Color, Command, Length, Settings, Size, Theme,
+    widget::{button, column, combo_box, container, row, scrollable, text, Button, Column, Text},
+    window::{self, get_latest, icon, resize},
+    Color, Length, Size, Task,
 };
 use log::{debug, error};
 use std::{
-    default,
-    fmt::{Display, Write},
+    fmt::Display,
     path::{Path, PathBuf},
 };
 use tokio::task::spawn_blocking;
 
+/// Title used for created windows
+pub const WINDOW_TITLE: &str =
+    concat!("Pocket Relay Plugin Installer v", env!("CARGO_PKG_VERSION"));
+/// Window icon bytes
+pub const ICON_BYTES: &[u8] = include_bytes!("./resources/icon.ico");
+
 /// The window size
-const WINDOW_SIZE: (u32, u32) = (500, 140);
-const EXPANDED_WINDOW_SIZE: (u32, u32) = (500, 300);
+const WINDOW_SIZE: Size<f32> = Size::new(500.0, 140.0);
+const EXPANDED_WINDOW_SIZE: Size<f32> = Size::new(500.0, 300.0);
 
 /// Initializes the user interface
 ///
@@ -30,18 +35,56 @@ const EXPANDED_WINDOW_SIZE: (u32, u32) = (500, 300);
 /// * `config` - The client config to use
 /// * `client` - The HTTP client to use
 pub fn init() {
-    App::run(Settings {
-        window: window::Settings {
+    iced::application(WINDOW_TITLE, App::update, App::view)
+        .window(window::Settings {
             icon: icon::from_file_data(ICON_BYTES, None).ok(),
             size: WINDOW_SIZE,
             resizable: false,
 
             ..window::Settings::default()
-        },
-        flags: (),
-        ..Settings::default()
-    })
-    .unwrap();
+        })
+        // .theme(iced::Theme::Dark)
+        .run_with(move || {
+            (
+                App {
+                    state: Default::default(),
+                    plugin_details_state: Default::default(),
+                },
+                Task::perform(
+                    async move {
+                        let mut options = Vec::new();
+
+                        let release = get_latest_plugin_release().await?;
+                        let beta_release = get_latest_beta_plugin_release().await?;
+
+                        options.push(ReleaseType::Stable(release.clone()));
+                        if let Some(beta_release) = beta_release {
+                            options.push(ReleaseType::Beta(beta_release));
+                        }
+
+                        let selected = options
+                            .first()
+                            .cloned()
+                            .context("no release versions found")?;
+
+                        let release_type_state = combo_box::State::<ReleaseType>::new(options);
+
+                        Ok::<_, anyhow::Error>(PluginDetails {
+                            release_type_state,
+                            selected,
+                        })
+                    },
+                    |result| {
+                        let result = result.map_err(|err| {
+                            error!("failed to remove plugin: {err:?}");
+                            format!("{err:?}")
+                        });
+                        AppMessage::PluginDetails(PluginDetailsMessage::Loaded(result))
+                    },
+                ),
+            )
+        })
+        .expect("failed to start");
 }
 
 struct App {
@@ -51,15 +94,24 @@ struct App {
     plugin_details_state: PluginDetailsState,
 }
 
-#[derive(Default)]
 pub enum AppState {
     /// Initial state, no game has been picked yet
-    #[default]
-    Initial,
+    Initial {
+        /// Optionally an error that has occurred when the user is picking a file
+        pick_file_error: Option<String>,
+    },
 
     /// Active state, game has been selected and its
     /// details are known
     Active(AppStateActive),
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::Initial {
+            pick_file_error: None,
+        }
+    }
 }
 
 pub struct AppStateActive {
@@ -74,6 +126,9 @@ pub struct AppStateActive {
 
     /// Current status of adding/removing a plugin
     alter_plugin_state: AlterPluginState,
+
+    /// Current status of adding/removing the patch
+    alter_patch_state: AlterPatchState,
 }
 
 #[derive(Debug, Clone)]
@@ -105,11 +160,16 @@ enum PluginMessage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum AppMessage {
     /// Trigger the popup to allow the user to pick the game path
     PickGamePath,
     /// Result of the user picking the game path
     PickedGamePath(Option<GameState>),
+    /// Error encountered while picking a game path
+    PickedGameError(String),
+    /// Clears the active game path
+    ClearGamePath,
 
     /// Messages related to patching the game
     Patch(PatchMessage),
@@ -129,6 +189,7 @@ enum PluginDetailsMessage {
 
 /// Current state for the plugin details (Remote state from github)
 #[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 pub enum PluginDetailsState {
     /// Loading details about the plugin
     #[default]
@@ -147,6 +208,23 @@ pub struct PluginDetails {
     release_type_state: combo_box::State<ReleaseType>,
     /// Selected release type
     selected: ReleaseType,
+}
+
+/// Current state for the plugin add process
+#[derive(Default)]
+pub enum AlterPatchState {
+    /// Initial state, patch has not been added or removed yet
+    #[default]
+    Initial,
+
+    /// Loading state, patch is being applied/removed
+    Loading,
+
+    /// Patch was added/removed successfully
+    Success,
+
+    /// Failed to add/remove the patch
+    Error(String),
 }
 
 /// Current state for the plugin add process
@@ -210,343 +288,10 @@ const DARK_TEXT: Color = Color::from_rgb(0.4, 0.4, 0.4);
 const SPACING: u16 = 10;
 
 impl App {
-    fn update_patch(&mut self, msg: PatchMessage) -> Command<PatchMessage> {
-        let state = match &mut self.state {
-            AppState::Active(state) => state,
-            _ => panic!("app reached invalid state, expecting 'Active' state"),
-        };
-
-        match msg {
-            PatchMessage::Add => {
-                let path = state.path.to_path_buf();
-                return Command::perform(async move { apply_patch(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to apply patch: {err:?}");
-                        format!("{err:?}")
-                    });
-
-                    PatchMessage::Added(result)
-                });
-            }
-            PatchMessage::Remove => {
-                let path = state.path.to_path_buf();
-                return Command::perform(async move { remove_patch(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to remove patch: {err:?}");
-                        format!("{err:?}")
-                    });
-
-                    PatchMessage::Removed(result)
-                });
-            }
-            PatchMessage::Added(result) => {
-                if let Err(err) = result {
-                    show_error("Failed to apply patch", &err);
-                } else {
-                    state.patched = true;
-                    show_info("Applied patch", "Successfully applied patch");
-                }
-            }
-            PatchMessage::Removed(result) => {
-                if let Err(err) = result {
-                    show_error("Failed to remove patch", &err);
-                } else {
-                    state.patched = false;
-                    show_info("Removed patch", "Successfully removed patch");
-                }
-            }
-        }
-
-        Command::none()
-    }
-
-    fn update_plugin(&mut self, msg: PluginMessage) -> Command<PluginMessage> {
-        let state = match &mut self.state {
-            AppState::Active(state) => state,
-            _ => panic!("app reached invalid state, expecting 'Active' state"),
-        };
-
-        match msg {
-            PluginMessage::Add => {
-                let release = match &self.plugin_details_state {
-                    PluginDetailsState::Ready(details) => &details.selected,
-                    _ => panic!("invalid plugin details state, expecting 'Ready' state"),
-                };
-
-                let release = match release {
-                    ReleaseType::Stable(value) => value.clone(),
-                    ReleaseType::Beta(value) => value.clone(),
-                };
-
-                let path = state.path.to_path_buf();
-
-                state.alter_plugin_state = AlterPluginState::Loading;
-
-                return Command::perform(
-                    async move { apply_plugin(&path, &release).await },
-                    |result| {
-                        let result = result.map_err(|err| {
-                            error!("failed to add plugin: {err:?}");
-                            format!("{err:?}")
-                        });
-
-                        PluginMessage::Added(result)
-                    },
-                );
-            }
-            PluginMessage::Remove => {
-                let path = state.path.to_path_buf();
-
-                state.alter_plugin_state = AlterPluginState::Initial;
-
-                return Command::perform(async move { remove_plugin(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to remove plugin: {err:?}");
-                        format!("{err:?}")
-                    });
-                    PluginMessage::Removed(result)
-                });
-            }
-            PluginMessage::Added(result) => {
-                if let Err(err) = result {
-                    show_error("Failed to apply plugin", &err);
-                    state.alter_plugin_state = AlterPluginState::Error(err);
-                } else {
-                    show_info("Applied plugin", "Successfully applied plugin");
-                    state.alter_plugin_state = AlterPluginState::Success;
-                    state.plugin = true;
-                }
-            }
-            PluginMessage::Removed(result) => {
-                if let Err(err) = result {
-                    show_error("Failed to remove plugin", &err);
-                } else {
-                    state.plugin = false;
-                    show_info("Removed plugin", "Successfully removed plugin");
-                }
-            }
-            PluginMessage::SelectType(release_type) => match &mut self.plugin_details_state {
-                PluginDetailsState::Ready(plugin_details) => {
-                    plugin_details.selected = release_type;
-                }
-                _ => {}
-            },
-        }
-
-        Command::none()
-    }
-
-    fn update_plugin_details(
-        &mut self,
-        msg: PluginDetailsMessage,
-    ) -> Command<PluginDetailsMessage> {
-        match msg {
-            PluginDetailsMessage::Loaded(result) => match result {
-                Ok(value) => {
-                    self.plugin_details_state = PluginDetailsState::Ready(value);
-                }
-                Err(err) => {
-                    show_error("Failed to load plugin details", &err);
-
-                    self.plugin_details_state = PluginDetailsState::Error(err);
-                }
-            },
-        }
-
-        Command::none()
-    }
-
-    fn render_patch_section(state: &AppStateActive) -> Column<'_, AppMessage> {
-        // Game is already patched
-        if state.patched {
-            let patch_text: Text = text("Your game is patched").style(DARK_TEXT);
-            let remove_patch_button: Button<_> = button("Remove Patch")
-                .on_press(AppMessage::Patch(PatchMessage::Remove))
-                .padding(10);
-
-            return column![patch_text, remove_patch_button].spacing(10);
-        }
-
-        let patch_text: Text =
-            text("Your game is not patched, you must apply the patch to use the client plugin.")
-                .style(DARK_TEXT);
-        let apply_patch_button: Button<_> = button("Apply Patch")
-            .on_press(AppMessage::Patch(PatchMessage::Add))
-            .padding(10);
-
-        column![patch_text, apply_patch_button].spacing(10)
-    }
-
-    fn render_plugin_section<'a>(
-        state: &'a AppStateActive,
-        plugin_details: &'a PluginDetailsState,
-    ) -> Column<'a, AppMessage> {
-        match (state.plugin, &state.alter_plugin_state) {
-            // Plugin is installed
-            (true, AlterPluginState::Initial) => {
-                let plugin_text: Text =
-                    text("You have the Pocket Relay client plugin installed.").style(DARK_TEXT);
-                let remove_plugin_button: Button<_> = button("Remove Plugin")
-                    .on_press(AppMessage::Plugin(PluginMessage::Remove))
-                    .padding(10);
-
-                return column![plugin_text, remove_plugin_button].spacing(10);
-            }
-
-            // Plugin is not installed, we are in the initial state
-            (false, AlterPluginState::Initial) => {
-                match plugin_details {
-                    // Still loading the plugin details
-                    PluginDetailsState::Loading => {
-                        let plugin_text: Text =
-                            text("You do not have the Pocket Relay client plugin installed")
-                                .style(DARK_TEXT);
-                        let plugin_version_text: Text =
-                            text("Loading latest plugin version details...").style(DARK_TEXT);
-                        column![plugin_text, plugin_version_text].spacing(10)
-                    }
-                    PluginDetailsState::Error(_) => {
-                        let plugin_text: Text =
-                            text("You do not have the Pocket Relay client plugin installed")
-                                .style(DARK_TEXT);
-                        let plugin_version_text: Text =
-                            text("Unable to load latest plugin version").style(DARK_TEXT);
-                        column![plugin_text, plugin_version_text].spacing(10)
-                    }
-                    PluginDetailsState::Ready(plugin_details) => {
-                        let plugin_text: Text =
-                            text("You do not have the Pocket Relay client plugin installed")
-                                .style(DARK_TEXT);
-
-                        let release = match &plugin_details.selected {
-                            ReleaseType::Stable(value) => value,
-                            ReleaseType::Beta(value) => value,
-                        };
-
-                        let version = &release.tag_name;
-
-                        let plugin_version_text: Text = text(format!(
-                            "The latest version of the plugin client is {version}"
-                        ))
-                        .style(DARK_TEXT);
-
-                        let add_plugin_button: Button<_> = button("Add Plugin")
-                            .on_press(AppMessage::Plugin(PluginMessage::Add))
-                            .padding(10);
-
-                        let version_select = combo_box(
-                            &plugin_details.release_type_state,
-                            "Select version",
-                            Some(&plugin_details.selected),
-                            |value| AppMessage::Plugin(PluginMessage::SelectType(value)),
-                        );
-
-                        column![
-                            plugin_text,
-                            plugin_version_text,
-                            row![add_plugin_button, version_select].spacing(10)
-                        ]
-                        .spacing(10)
-                    }
-                }
-            }
-
-            // Plugin is not installed, we are installing
-            (false, AlterPluginState::Loading) => {
-                let plugin_text = text("Installing plugin...").style(Palette::DARK.primary);
-                column![plugin_text].spacing(10)
-            }
-
-            // Plugin is installed, we are uninstalling
-            (true, AlterPluginState::Loading) => {
-                let plugin_text = text("Uninstalling plugin...").style(Palette::DARK.primary);
-                column![plugin_text].spacing(10)
-            }
-
-            // Plugin was uninstalled
-            (false, AlterPluginState::Success) => {
-                let plugin_text: Text = text("Pocket Relay client plugin successfully removed.")
-                    .style(Palette::DARK.success);
-                let add_plugin_button: Button<_> = button("Add Plugin")
-                    .on_press(AppMessage::Plugin(PluginMessage::Add))
-                    .padding(10);
-
-                column![plugin_text, add_plugin_button].spacing(10)
-            }
-
-            // Plugin was installed
-            (true, AlterPluginState::Success) => {
-                let plugin_text: Text = text("Pocket Relay client plugin successfully installed.")
-                    .style(Palette::DARK.success);
-                let remove_plugin_button: Button<_> = button("Remove Plugin")
-                    .on_press(AppMessage::Plugin(PluginMessage::Remove))
-                    .padding(10);
-
-                column![plugin_text, remove_plugin_button].spacing(10)
-            }
-
-            // Error occurred
-            (plugin, AlterPluginState::Error(_)) => {
-                let (message, action) = match plugin {
-                    true => ("failed to remove plugin".to_string(), PluginMessage::Remove),
-                    false => ("failed to install plugin".to_string(), PluginMessage::Add),
-                };
-
-                let text: Text = text(message).style(Palette::DARK.danger);
-
-                let add_plugin_button: Button<_> = button("Retry")
-                    .on_press(AppMessage::Plugin(action))
-                    .padding(10);
-                column![text, add_plugin_button].spacing(10)
-            }
-        }
-    }
-}
-
-impl Application for App {
-    type Message = AppMessage;
-    type Executor = executor::Default;
-    type Flags = ();
-    type Theme = Theme;
-
-    fn new(_: Self::Flags) -> (Self, Command<Self::Message>) {
-        (
-            App {
-                state: Default::default(),
-                plugin_details_state: Default::default(),
-            },
-            Command::perform(
-                async move {
-                    let release = get_latest_plugin_release().await?;
-                    let release_type_state = combo_box::State::<ReleaseType>::new(vec![
-                        ReleaseType::Stable(release.clone()),
-                        ReleaseType::Beta(release.clone()),
-                    ]);
-
-                    Ok::<_, anyhow::Error>(PluginDetails {
-                        release_type_state,
-                        selected: ReleaseType::Stable(release.clone()),
-                    })
-                },
-                |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to remove plugin: {err:?}");
-                        format!("{err:?}")
-                    });
-                    AppMessage::PluginDetails(PluginDetailsMessage::Loaded(result))
-                },
-            ),
-        )
-    }
-
-    fn title(&self) -> String {
-        WINDOW_TITLE.to_string()
-    }
-
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
+    fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match message {
             AppMessage::PickGamePath => {
-                return Command::perform(
+                return Task::perform(
                     async move {
                         spawn_blocking(|| {
                             let path = native_dialog::FileDialog::new()
@@ -569,14 +314,20 @@ impl Application for App {
                     },
                     |result| match result {
                         Ok(value) => AppMessage::PickedGamePath(value),
-                        Err(err) => {
-                            let error_message =
-                                format!("error occurred while picking file: {err:?}");
-                            show_error("Failed to pick file", &error_message);
-                            AppMessage::PickedGamePath(None)
-                        }
+                        Err(err) => AppMessage::PickedGameError(format!("{err}")),
                     },
                 );
+            }
+            AppMessage::ClearGamePath => {
+                self.state = AppState::default();
+
+                // Resize window to fit main screen
+                return get_latest().and_then(|id| resize(id, WINDOW_SIZE));
+            }
+            AppMessage::PickedGameError(err) => {
+                if let AppState::Initial { pick_file_error } = &mut self.state {
+                    *pick_file_error = Some(err);
+                }
             }
             AppMessage::PickedGamePath(state) => {
                 debug!("picked path: {state:?}");
@@ -587,12 +338,13 @@ impl Application for App {
                         plugin: state.plugin,
                         path: state.path,
                         alter_plugin_state: Default::default(),
+                        alter_patch_state: Default::default(),
                     });
 
                     // Resize window to fit next screen
-                    return resize(Size::new(EXPANDED_WINDOW_SIZE.0, EXPANDED_WINDOW_SIZE.1));
+                    return get_latest().and_then(|id| resize(id, EXPANDED_WINDOW_SIZE));
                 } else {
-                    self.state = AppState::Initial
+                    self.state = AppState::default()
                 }
             }
             AppMessage::Patch(msg) => return self.update_patch(msg).map(AppMessage::Patch),
@@ -604,24 +356,174 @@ impl Application for App {
             }
         }
 
-        Command::none()
+        Task::none()
     }
 
-    fn view(&self) -> iced::Element<'_, Self::Message> {
+    fn update_patch(&mut self, msg: PatchMessage) -> Task<PatchMessage> {
+        let state = match &mut self.state {
+            AppState::Active(state) => state,
+            _ => panic!("app reached invalid state, expecting 'Active' state"),
+        };
+
+        match msg {
+            PatchMessage::Add => {
+                let path = state.path.to_path_buf();
+
+                state.alter_patch_state = AlterPatchState::Loading;
+
+                return Task::perform(async move { apply_patch(&path).await }, |result| {
+                    let result = result.map_err(|err| {
+                        error!("failed to apply patch: {err:?}");
+                        format!("{err:?}")
+                    });
+
+                    PatchMessage::Added(result)
+                });
+            }
+            PatchMessage::Remove => {
+                let path = state.path.to_path_buf();
+
+                state.alter_patch_state = AlterPatchState::Loading;
+
+                return Task::perform(async move { remove_patch(&path).await }, |result| {
+                    let result = result.map_err(|err| {
+                        error!("failed to remove patch: {err:?}");
+                        format!("{err:?}")
+                    });
+
+                    PatchMessage::Removed(result)
+                });
+            }
+            PatchMessage::Added(result) => {
+                if let Err(err) = result {
+                    state.alter_patch_state = AlterPatchState::Error(err);
+                } else {
+                    state.alter_patch_state = AlterPatchState::Success;
+                    state.patched = true;
+                }
+            }
+            PatchMessage::Removed(result) => {
+                if let Err(err) = result {
+                    state.alter_patch_state = AlterPatchState::Error(err);
+                } else {
+                    state.alter_patch_state = AlterPatchState::Success;
+                    state.patched = false;
+                }
+            }
+        }
+
+        Task::none()
+    }
+
+    fn update_plugin(&mut self, msg: PluginMessage) -> Task<PluginMessage> {
+        let state = match &mut self.state {
+            AppState::Active(state) => state,
+            _ => panic!("app reached invalid state, expecting 'Active' state"),
+        };
+
+        match msg {
+            PluginMessage::Add => {
+                let release = match &self.plugin_details_state {
+                    PluginDetailsState::Ready(details) => &details.selected,
+                    _ => panic!("invalid plugin details state, expecting 'Ready' state"),
+                };
+
+                let release = match release {
+                    ReleaseType::Stable(value) => value.clone(),
+                    ReleaseType::Beta(value) => value.clone(),
+                };
+
+                let path = state.path.to_path_buf();
+
+                state.alter_plugin_state = AlterPluginState::Loading;
+
+                return Task::perform(
+                    async move { apply_plugin(&path, &release).await },
+                    |result| {
+                        let result = result.map_err(|err| {
+                            error!("failed to add plugin: {err:?}");
+                            format!("{err:?}")
+                        });
+
+                        PluginMessage::Added(result)
+                    },
+                );
+            }
+            PluginMessage::Remove => {
+                let path = state.path.to_path_buf();
+
+                state.alter_plugin_state = AlterPluginState::Loading;
+
+                return Task::perform(async move { remove_plugin(&path).await }, |result| {
+                    let result = result.map_err(|err| {
+                        error!("failed to remove plugin: {err:?}");
+                        format!("{err:?}")
+                    });
+                    PluginMessage::Removed(result)
+                });
+            }
+            PluginMessage::Added(result) => {
+                if let Err(err) = result {
+                    state.alter_plugin_state = AlterPluginState::Error(err);
+                } else {
+                    state.alter_plugin_state = AlterPluginState::Success;
+                    state.plugin = true;
+                }
+            }
+            PluginMessage::Removed(result) => {
+                if let Err(err) = result {
+                    state.alter_plugin_state = AlterPluginState::Error(err);
+                } else {
+                    state.alter_plugin_state = AlterPluginState::Success;
+                    state.plugin = false;
+                }
+            }
+            PluginMessage::SelectType(release_type) => {
+                if let PluginDetailsState::Ready(plugin_details) = &mut self.plugin_details_state {
+                    plugin_details.selected = release_type;
+                }
+            }
+        }
+
+        Task::none()
+    }
+
+    fn update_plugin_details(&mut self, msg: PluginDetailsMessage) -> Task<PluginDetailsMessage> {
+        match msg {
+            PluginDetailsMessage::Loaded(result) => match result {
+                Ok(value) => {
+                    self.plugin_details_state = PluginDetailsState::Ready(value);
+                }
+                Err(err) => {
+                    self.plugin_details_state = PluginDetailsState::Error(err);
+                }
+            },
+        }
+
+        Task::none()
+    }
+
+    fn view(&self) -> iced::Element<'_, AppMessage> {
         let state: &AppStateActive = match &self.state {
-            AppState::Initial => {
+            AppState::Initial { pick_file_error } => {
                 let target_text: Text = text(
                     "Please click the button below to choose your game path. \
                     When the file picker opens navigate to the folder containing \
                     MassEffect3.exe and pick that file",
                 )
-                .style(DARK_TEXT);
+                .color(DARK_TEXT);
 
                 let pick_button: Button<_> = button("Choose game path")
                     .on_press(AppMessage::PickGamePath)
                     .padding(10);
 
-                let content: Column<_> = column![target_text, pick_button].spacing(10);
+                let mut content: Column<_> = column![target_text, pick_button].spacing(10);
+
+                if let Some(err) = pick_file_error {
+                    content = content.push(
+                        text(format!("failed to pick file: {err}")).color(Palette::DARK.danger),
+                    );
+                }
 
                 return container(content)
                     .width(Length::Fill)
@@ -632,22 +534,229 @@ impl Application for App {
             AppState::Active(active) => active,
         };
 
+        let back_button: Button<_> = button("Back")
+            .on_press(AppMessage::ClearGamePath)
+            .padding(10);
+
         // Section for applying and removing the patch
-        let patch_section = Self::render_patch_section(state);
+        let patch_section = Self::view_patch_section(state);
 
         // Section for applying and removing the plugin
-        let plugin_section = Self::render_plugin_section(state, &self.plugin_details_state);
+        let plugin_section = Self::view_plugin_section(state, &self.plugin_details_state);
 
-        let content: Column<_> = column![patch_section, plugin_section].spacing(10);
+        let content: Column<_> = column![back_button, patch_section, plugin_section].spacing(10);
 
-        container(content)
+        container(scrollable(content))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(SPACING)
             .into()
     }
 
-    fn theme(&self) -> iced::Theme {
-        iced::Theme::Dark
+    /// View for the patch game section
+    fn view_patch_section(state: &AppStateActive) -> Column<'_, AppMessage> {
+        match (state.patched, &state.alter_patch_state) {
+            // Patch is installed, we are in the initial state
+            (true, AlterPatchState::Initial) => {
+                let patch_text: Text = text("Your game is patched").color(DARK_TEXT);
+                let remove_patch_button: Button<_> = button("Remove Patch")
+                    .on_press(AppMessage::Patch(PatchMessage::Remove))
+                    .padding(10);
+
+                column![patch_text, remove_patch_button].spacing(10)
+            }
+
+            // Patch is not installed, we are in the initial state
+            (false, AlterPatchState::Initial) => {
+                let patch_text: Text = text(
+                    "Your game is not patched, you must apply the patch to use the client plugin.",
+                )
+                .color(DARK_TEXT);
+                let apply_patch_button: Button<_> = button("Apply Patch")
+                    .on_press(AppMessage::Patch(PatchMessage::Add))
+                    .padding(10);
+
+                column![patch_text, apply_patch_button].spacing(10)
+            }
+
+            // Patch is not installed, we are installing
+            (false, AlterPatchState::Loading) => {
+                let patch_text = text("Installing patch...").color(Palette::DARK.primary);
+                column![patch_text].spacing(10)
+            }
+
+            // Patch is installed, we are uninstalling
+            (true, AlterPatchState::Loading) => {
+                let patch_text = text("Uninstalling patch...").color(Palette::DARK.primary);
+                column![patch_text].spacing(10)
+            }
+
+            // Patch was uninstalled
+            (false, AlterPatchState::Success) => {
+                let patch_text: Text =
+                    text("Patch successfully removed.").color(Palette::DARK.success);
+
+                let apply_patch_button: Button<_> = button("Apply Patch")
+                    .on_press(AppMessage::Patch(PatchMessage::Add))
+                    .padding(10);
+
+                column![patch_text, apply_patch_button].spacing(10)
+            }
+
+            // Patch was installed
+            (true, AlterPatchState::Success) => {
+                let patch_text: Text =
+                    text("Patch successfully installed.").color(Palette::DARK.success);
+                let remove_patch_button: Button<_> = button("Remove Patch")
+                    .on_press(AppMessage::Patch(PatchMessage::Remove))
+                    .padding(10);
+
+                column![patch_text, remove_patch_button].spacing(10)
+            }
+
+            // Error occurred
+            (plugin, AlterPatchState::Error(err)) => {
+                let (message, action) = match plugin {
+                    true => (
+                        format!("failed to remove patch: {err}"),
+                        PatchMessage::Remove,
+                    ),
+                    false => (format!("failed to add patch: {err}"), PatchMessage::Add),
+                };
+
+                let patch_text: Text = text(message).color(Palette::DARK.danger);
+
+                let retry_button: Button<_> = button("Retry")
+                    .on_press(AppMessage::Patch(action))
+                    .padding(10);
+                column![patch_text, retry_button].spacing(10)
+            }
+        }
+    }
+
+    /// View for the add plugin section
+    fn view_plugin_section<'a>(
+        state: &'a AppStateActive,
+        plugin_details: &'a PluginDetailsState,
+    ) -> Column<'a, AppMessage> {
+        match (state.plugin, &state.alter_plugin_state) {
+            // Plugin is installed, we are in the initial state
+            (true, AlterPluginState::Initial) => {
+                let plugin_text: Text =
+                    text("You have the Pocket Relay client plugin installed.").color(DARK_TEXT);
+                let remove_plugin_button: Button<_> = button("Remove Plugin")
+                    .on_press(AppMessage::Plugin(PluginMessage::Remove))
+                    .padding(10);
+
+                return column![plugin_text, remove_plugin_button].spacing(10);
+            }
+
+            // Plugin is not installed, we are in the initial state
+            (false, AlterPluginState::Initial) => {
+                let plugin_text: Text =
+                    text("You do not have the Pocket Relay client plugin installed")
+                        .color(DARK_TEXT);
+                let add_plugin = Self::view_add_plugin(plugin_details);
+                column![plugin_text, add_plugin].spacing(10)
+            }
+
+            // Plugin is not installed, we are installing
+            (false, AlterPluginState::Loading) => {
+                let plugin_text = text("Installing plugin...").color(Palette::DARK.primary);
+                column![plugin_text].spacing(10)
+            }
+
+            // Plugin is installed, we are uninstalling
+            (true, AlterPluginState::Loading) => {
+                let plugin_text = text("Uninstalling plugin...").color(Palette::DARK.primary);
+                column![plugin_text].spacing(10)
+            }
+
+            // Plugin was uninstalled
+            (false, AlterPluginState::Success) => {
+                let plugin_text: Text = text("Pocket Relay client plugin successfully removed.")
+                    .color(Palette::DARK.success);
+
+                let add_plugin = Self::view_add_plugin(plugin_details);
+                column![plugin_text, add_plugin].spacing(10)
+            }
+
+            // Plugin was installed
+            (true, AlterPluginState::Success) => {
+                let plugin_text: Text = text("Pocket Relay client plugin successfully installed.")
+                    .color(Palette::DARK.success);
+                let remove_plugin_button: Button<_> = button("Remove Plugin")
+                    .on_press(AppMessage::Plugin(PluginMessage::Remove))
+                    .padding(10);
+
+                column![plugin_text, remove_plugin_button].spacing(10)
+            }
+
+            // Error occurred
+            (plugin, AlterPluginState::Error(err)) => {
+                let (message, action) = match plugin {
+                    true => (
+                        format!("failed to remove plugin: {err}"),
+                        PluginMessage::Remove,
+                    ),
+                    false => (
+                        format!("failed to install plugin: {err}"),
+                        PluginMessage::Add,
+                    ),
+                };
+
+                let text: Text = text(message).color(Palette::DARK.danger);
+
+                let add_plugin_button: Button<_> = button("Retry")
+                    .on_press(AppMessage::Plugin(action))
+                    .padding(10);
+                column![text, add_plugin_button].spacing(10)
+            }
+        }
+    }
+
+    /// View for the add plugin details and buttons
+    fn view_add_plugin(plugin_details: &PluginDetailsState) -> Column<'_, AppMessage> {
+        match plugin_details {
+            // Still loading the plugin details
+            PluginDetailsState::Loading => {
+                let plugin_version_text: Text =
+                    text("Loading latest plugin version details...").color(DARK_TEXT);
+                column![plugin_version_text].spacing(10)
+            }
+            PluginDetailsState::Error(err) => {
+                let plugin_version_text: Text =
+                    text(format!("Unable to load latest plugin version: {err}")).color(DARK_TEXT);
+                column![plugin_version_text].spacing(10)
+            }
+            PluginDetailsState::Ready(plugin_details) => {
+                let release = match &plugin_details.selected {
+                    ReleaseType::Stable(value) => value,
+                    ReleaseType::Beta(value) => value,
+                };
+
+                let version = &release.tag_name;
+
+                let plugin_version_text: Text = text(format!(
+                    "The latest version of the plugin client is {version}"
+                ))
+                .color(DARK_TEXT);
+
+                let add_plugin_button: Button<_> = button("Add Plugin")
+                    .on_press(AppMessage::Plugin(PluginMessage::Add))
+                    .padding(10);
+
+                let version_select = combo_box(
+                    &plugin_details.release_type_state,
+                    "Select version",
+                    Some(&plugin_details.selected),
+                    |value| AppMessage::Plugin(PluginMessage::SelectType(value)),
+                )
+                .padding(10);
+
+                let add_row = row![add_plugin_button, version_select].spacing(10);
+                column![plugin_version_text, add_row].spacing(10)
+            }
+        }
     }
 }

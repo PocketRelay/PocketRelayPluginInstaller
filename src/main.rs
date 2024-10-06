@@ -4,11 +4,9 @@
 )]
 #![warn(unused_crate_dependencies)]
 
+mod bink;
 mod github;
 mod iced;
-mod ui;
-
-mod bink;
 mod plugin;
 
 /// Application crate version string
