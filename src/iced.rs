@@ -50,38 +50,7 @@ pub fn init() {
                     state: Default::default(),
                     plugin_details_state: Default::default(),
                 },
-                Task::perform(
-                    async move {
-                        let mut options = Vec::new();
-
-                        let release = get_latest_plugin_release().await?;
-                        let beta_release = get_latest_beta_plugin_release().await?;
-
-                        options.push(ReleaseType::Stable(release.clone()));
-                        if let Some(beta_release) = beta_release {
-                            options.push(ReleaseType::Beta(beta_release));
-                        }
-
-                        let selected = options
-                            .first()
-                            .cloned()
-                            .context("no release versions found")?;
-
-                        let release_type_state = combo_box::State::<ReleaseType>::new(options);
-
-                        Ok::<_, anyhow::Error>(PluginDetails {
-                            release_type_state,
-                            selected,
-                        })
-                    },
-                    |result| {
-                        let result = result.map_err(|err| {
-                            error!("failed to remove plugin: {err:?}");
-                            format!("{err:?}")
-                        });
-                        AppMessage::PluginDetails(PluginDetailsMessage::Loaded(result))
-                    },
-                ),
+                plugin_details_task(),
             )
         })
         .expect("failed to start");
@@ -286,6 +255,42 @@ fn read_game_state(exe_path: &Path) -> anyhow::Result<GameState> {
 
 const DARK_TEXT: Color = Color::from_rgb(0.4, 0.4, 0.4);
 const SPACING: u16 = 10;
+
+/// Obtains the plugin details for the current available releases
+async fn get_plugin_details() -> anyhow::Result<PluginDetails> {
+    let mut options = Vec::new();
+
+    let release = get_latest_plugin_release().await?;
+    let beta_release = get_latest_beta_plugin_release().await?;
+
+    options.push(ReleaseType::Stable(release.clone()));
+    if let Some(beta_release) = beta_release {
+        options.push(ReleaseType::Beta(beta_release));
+    }
+
+    let selected = options
+        .first()
+        .cloned()
+        .context("no release versions found")?;
+
+    let release_type_state = combo_box::State::<ReleaseType>::new(options);
+
+    Ok::<_, anyhow::Error>(PluginDetails {
+        release_type_state,
+        selected,
+    })
+}
+
+/// Creates a task that will load and update the plugin details
+fn plugin_details_task() -> Task<AppMessage> {
+    Task::perform(get_plugin_details(), |result| {
+        let result = result.map_err(|err| {
+            error!("failed to load plugin details: {err:?}");
+            format!("{err:?}")
+        });
+        AppMessage::PluginDetails(PluginDetailsMessage::Loaded(result))
+    })
+}
 
 impl App {
     fn update(&mut self, message: AppMessage) -> Task<AppMessage> {

@@ -1,9 +1,10 @@
-use std::path::Path;
-
-use anyhow::Context;
-use log::debug;
+//! Module for helpers related to finding plugin releases and applying/removing the plugin
+//! from the game
 
 use crate::github::{download_latest_release, get_latest_release, get_releases, GitHubRelease};
+use anyhow::Context;
+use log::debug;
+use std::path::Path;
 
 /// Client user agent created from the name and version
 pub const USER_AGENT: &str = concat!("PocketRelayPluginInstaller/v", env!("CARGO_PKG_VERSION"));
@@ -12,6 +13,12 @@ pub const USER_AGENT: &str = concat!("PocketRelayPluginInstaller/v", env!("CARGO
 pub const GITHUB_REPOSITORY: &str = "PocketRelay/PocketRelayClientPlugin";
 /// GitHub asset name for the plugin file
 pub const ASSET_NAME: &str = "pocket-relay-plugin.asi";
+
+/// Name of the plugin directory
+pub const PLUGIN_DIR: &str = "ASI";
+
+/// Name of the plugin file
+pub const PLUGIN_NAME: &str = "pocket-relay-plugin.asi";
 
 /// Determines the latest release version of the plugin
 pub async fn get_latest_plugin_release() -> anyhow::Result<GitHubRelease> {
@@ -26,28 +33,34 @@ pub async fn get_latest_plugin_release() -> anyhow::Result<GitHubRelease> {
 
     Ok(latest_release)
 }
-/// Determines the latest release version of the plugin
+
+/// Finds the latest beta release of the plugin by searching for the newest
+/// release marked as a prerelease
 pub async fn get_latest_beta_plugin_release() -> anyhow::Result<Option<GitHubRelease>> {
     let http_client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .build()
         .context("failed to build http client")?;
 
+    // Request the list of releases
     let mut releases = get_releases(&http_client, GITHUB_REPOSITORY)
         .await
         .context("failed finding latest plugin client version")?;
+
+    // Retain only the prerelease's
     releases.retain(|value| value.prerelease);
 
+    // Sort on the published_at descending
     releases.sort_by(|a, b| a.published_at.cmp(&b.published_at).reverse());
-
-    debug!("{:?}", releases);
 
     Ok(releases.first().cloned())
 }
 
+/// Applies the plugin from the provided `release`, downloads the plugin and saves
+/// it to the plugin directory
 pub async fn apply_plugin(game_path: &Path, release: &GitHubRelease) -> anyhow::Result<()> {
-    let asi_path = game_path.join("ASI");
-    let plugin_path = asi_path.join("pocket-relay-plugin.asi");
+    let asi_path = game_path.join(PLUGIN_DIR);
+    let plugin_path = asi_path.join(PLUGIN_NAME);
 
     let http_client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -76,9 +89,10 @@ pub async fn apply_plugin(game_path: &Path, release: &GitHubRelease) -> anyhow::
     Ok(())
 }
 
+/// Removes the plugin from the game directory
 pub async fn remove_plugin(game_path: &Path) -> anyhow::Result<()> {
-    let asi_path = game_path.join("ASI");
-    let plugin_path = asi_path.join("pocket-relay-plugin.asi");
+    let asi_path = game_path.join(PLUGIN_DIR);
+    let plugin_path = asi_path.join(PLUGIN_NAME);
     tokio::fs::remove_file(plugin_path).await?;
     Ok(())
 }
