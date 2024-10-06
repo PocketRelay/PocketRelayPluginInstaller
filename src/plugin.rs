@@ -4,7 +4,7 @@
 use crate::github::{download_latest_release, get_latest_release, get_releases, GitHubRelease};
 use anyhow::Context;
 use log::debug;
-use std::path::Path;
+use std::path::PathBuf;
 
 /// Client user agent created from the name and version
 pub const USER_AGENT: &str = concat!("PocketRelayPluginInstaller/v", env!("CARGO_PKG_VERSION"));
@@ -58,7 +58,7 @@ pub async fn get_latest_beta_plugin_release() -> anyhow::Result<Option<GitHubRel
 
 /// Applies the plugin from the provided `release`, downloads the plugin and saves
 /// it to the plugin directory
-pub async fn apply_plugin(game_path: &Path, release: &GitHubRelease) -> anyhow::Result<()> {
+pub async fn apply_plugin(game_path: PathBuf, release: GitHubRelease) -> anyhow::Result<()> {
     let asi_path = game_path.join(PLUGIN_DIR);
     let plugin_path = asi_path.join(PLUGIN_NAME);
 
@@ -90,7 +90,7 @@ pub async fn apply_plugin(game_path: &Path, release: &GitHubRelease) -> anyhow::
 }
 
 /// Removes the plugin from the game directory
-pub async fn remove_plugin(game_path: &Path) -> anyhow::Result<()> {
+pub async fn remove_plugin(game_path: PathBuf) -> anyhow::Result<()> {
     let asi_path = game_path.join(PLUGIN_DIR);
     let plugin_path = asi_path.join(PLUGIN_NAME);
     tokio::fs::remove_file(plugin_path).await?;

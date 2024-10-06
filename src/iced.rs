@@ -28,6 +28,8 @@ pub const ICON_BYTES: &[u8] = include_bytes!("./resources/icon.ico");
 /// The window size
 const WINDOW_SIZE: Size<f32> = Size::new(500.0, 140.0);
 const EXPANDED_WINDOW_SIZE: Size<f32> = Size::new(500.0, 300.0);
+const DARK_TEXT: Color = Color::from_rgb(0.4, 0.4, 0.4);
+const SPACING: u16 = 10;
 
 /// Initializes the user interface
 ///
@@ -43,19 +45,12 @@ pub fn init() {
 
             ..window::Settings::default()
         })
-        // .theme(iced::Theme::Dark)
-        .run_with(move || {
-            (
-                App {
-                    state: Default::default(),
-                    plugin_details_state: Default::default(),
-                },
-                plugin_details_task(),
-            )
-        })
+        .theme(|_| iced::Theme::Dark)
+        .run_with(|| (Default::default(), plugin_details_task()))
         .expect("failed to start");
 }
 
+#[derive(Default)]
 struct App {
     state: AppState,
 
@@ -132,14 +127,8 @@ enum PluginMessage {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 enum AppMessage {
-    /// Trigger the popup to allow the user to pick the game path
-    PickGamePath,
-    /// Result of the user picking the game path
-    PickedGamePath(Option<GameState>),
-    /// Error encountered while picking a game path
-    PickedGameError(String),
-    /// Clears the active game path
-    ClearGamePath,
+    /// Messages related to picking the game
+    Game(GameMessage),
 
     /// Messages related to patching the game
     Patch(PatchMessage),
@@ -149,6 +138,16 @@ enum AppMessage {
 
     /// Messages related to loading the plugin details
     PluginDetails(PluginDetailsMessage),
+}
+
+#[derive(Debug, Clone)]
+enum GameMessage {
+    /// Trigger the popup to allow the user to pick the game path
+    PickGamePath,
+    // Result of picking a game path
+    PickedGameResult(Result<Option<GameState>, String>),
+    /// Clears the active game path
+    ClearGamePath,
 }
 
 #[derive(Debug, Clone)]
@@ -238,12 +237,14 @@ impl Display for ReleaseType {
 
 /// Reads the current patch and plugin state from the provided
 /// game path
-fn read_game_state(exe_path: &Path) -> anyhow::Result<GameState> {
+async fn read_game_state(exe_path: &Path) -> anyhow::Result<GameState> {
     let parent = exe_path.parent().context("missing game folder")?;
     let asi_path = parent.join("ASI");
 
     let plugin_path = asi_path.join("pocket-relay-plugin.asi");
-    let is_patched = is_patched(parent).context("failed to check game patched state")?;
+    let is_patched = is_patched(parent)
+        .await
+        .context("failed to check game patched state")?;
 
     let plugin = plugin_path.exists() && plugin_path.is_file();
 
@@ -253,9 +254,6 @@ fn read_game_state(exe_path: &Path) -> anyhow::Result<GameState> {
         plugin,
     })
 }
-
-const DARK_TEXT: Color = Color::from_rgb(0.4, 0.4, 0.4);
-const SPACING: u16 = 10;
 
 /// Obtains the plugin details for the current available releases
 async fn get_plugin_details() -> anyhow::Result<PluginDetails> {
@@ -293,6 +291,30 @@ fn plugin_details_task() -> Task<AppMessage> {
     })
 }
 
+async fn pick_game_state() -> anyhow::Result<Option<GameState>> {
+    // Spawn new thread for the native file picker dialog
+    let path = spawn_blocking(|| {
+        native_dialog::FileDialog::new()
+            .add_filter("MassEffect3.exe", &["exe"])
+            .set_filename("MassEffect3.exe")
+            .set_title("Choose game executable")
+            .show_open_single_file()
+            .context("failed to pick file")
+    })
+    .await
+    .context("failed to join native thread")?
+    .context("failed to pick file")?;
+
+    let path = match path {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+
+    // Read the state from the chosen path
+    let game_state = read_game_state(path.as_ref()).await?;
+    Ok(Some(game_state))
+}
+
 impl App {
     /// View entry point for the app
     fn view(&self) -> iced::Element<'_, AppMessage> {
@@ -312,7 +334,7 @@ impl App {
         .color(DARK_TEXT);
 
         let pick_button: Button<_> = button("Choose game path")
-            .on_press(AppMessage::PickGamePath)
+            .on_press(AppMessage::Game(GameMessage::PickGamePath))
             .padding(10);
 
         let mut content: Column<_> = column![target_text, pick_button].spacing(10);
@@ -332,7 +354,7 @@ impl App {
     /// View for the app when its in the active state
     fn view_active<'a>(&'a self, state: &'a AppStateActive) -> iced::Element<'a, AppMessage> {
         let back_button: Button<_> = button("Back")
-            .on_press(AppMessage::ClearGamePath)
+            .on_press(AppMessage::Game(GameMessage::ClearGamePath))
             .padding(10);
 
         // Section for applying and removing the patch
@@ -592,69 +614,57 @@ impl App {
 
     fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match message {
-            AppMessage::PickGamePath => {
-                return Task::perform(
-                    async move {
-                        spawn_blocking(|| {
-                            let path = native_dialog::FileDialog::new()
-                                .add_filter("MassEffect3.exe", &["exe"])
-                                .set_filename("MassEffect3.exe")
-                                .set_title("Choose game executable")
-                                .show_open_single_file()
-                                .context("failed to pick file")?;
-                            let path = match path {
-                                Some(path) => path,
-                                None => return anyhow::Ok(None),
-                            };
+            AppMessage::Game(msg) => self.update_game(msg).map(AppMessage::Game),
+            AppMessage::Patch(msg) => self.update_patch(msg).map(AppMessage::Patch),
+            AppMessage::Plugin(msg) => self.update_plugin(msg).map(AppMessage::Plugin),
+            AppMessage::PluginDetails(msg) => self
+                .update_plugin_details(msg)
+                .map(AppMessage::PluginDetails),
+        }
+    }
 
-                            let game_state = read_game_state(path.as_ref())?;
-                            Ok(Some(game_state))
-                        })
-                        .await
-                        .context("failed to join native thread")?
-                        .context("failed to pick file")
-                    },
-                    |result| match result {
-                        Ok(value) => AppMessage::PickedGamePath(value),
-                        Err(err) => AppMessage::PickedGameError(format!("{err}")),
-                    },
-                );
+    fn update_game(&mut self, msg: GameMessage) -> Task<GameMessage> {
+        match msg {
+            GameMessage::PickGamePath => {
+                return Task::perform(pick_game_state(), |result| {
+                    let result = result.map_err(|err| format!("{err:?}"));
+                    GameMessage::PickedGameResult(result)
+                });
             }
-            AppMessage::ClearGamePath => {
+            GameMessage::PickedGameResult(result) => {
+                match result {
+                    Ok(state) => {
+                        debug!("picked path: {state:?}");
+
+                        if let Some(state) = state {
+                            self.state = AppState::Active(AppStateActive {
+                                patched: state.patched,
+                                plugin: state.plugin,
+                                path: state.path,
+                                alter_plugin_state: Default::default(),
+                                alter_patch_state: Default::default(),
+                            });
+
+                            // Resize window to fit next screen
+                            return get_latest().and_then(|id| resize(id, EXPANDED_WINDOW_SIZE));
+                        } else {
+                            self.state = AppState::default()
+                        }
+                    }
+                    Err(err) => {
+                        error!("failed to pick game path: {err}");
+
+                        if let AppState::Initial(state) = &mut self.state {
+                            state.pick_file_error = Some(err);
+                        }
+                    }
+                }
+            }
+            GameMessage::ClearGamePath => {
                 self.state = AppState::default();
 
                 // Resize window to fit main screen
                 return get_latest().and_then(|id| resize(id, WINDOW_SIZE));
-            }
-            AppMessage::PickedGameError(err) => {
-                if let AppState::Initial(state) = &mut self.state {
-                    state.pick_file_error = Some(err);
-                }
-            }
-            AppMessage::PickedGamePath(state) => {
-                debug!("picked path: {state:?}");
-
-                if let Some(state) = state {
-                    self.state = AppState::Active(AppStateActive {
-                        patched: state.patched,
-                        plugin: state.plugin,
-                        path: state.path,
-                        alter_plugin_state: Default::default(),
-                        alter_patch_state: Default::default(),
-                    });
-
-                    // Resize window to fit next screen
-                    return get_latest().and_then(|id| resize(id, EXPANDED_WINDOW_SIZE));
-                } else {
-                    self.state = AppState::default()
-                }
-            }
-            AppMessage::Patch(msg) => return self.update_patch(msg).map(AppMessage::Patch),
-            AppMessage::Plugin(msg) => return self.update_plugin(msg).map(AppMessage::Plugin),
-            AppMessage::PluginDetails(msg) => {
-                return self
-                    .update_plugin_details(msg)
-                    .map(AppMessage::PluginDetails)
             }
         }
 
@@ -669,35 +679,24 @@ impl App {
 
         match msg {
             PatchMessage::Add => {
-                let path = state.path.to_path_buf();
-
                 state.alter_patch_state = AlterPatchState::Loading;
 
-                return Task::perform(async move { apply_patch(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to apply patch: {err:?}");
-                        format!("{err:?}")
-                    });
-
+                return Task::perform(apply_patch(state.path.to_path_buf()), |result| {
+                    let result = result.map_err(|err| format!("{err:?}"));
                     PatchMessage::Added(result)
                 });
             }
             PatchMessage::Remove => {
-                let path = state.path.to_path_buf();
-
                 state.alter_patch_state = AlterPatchState::Loading;
 
-                return Task::perform(async move { remove_patch(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to remove patch: {err:?}");
-                        format!("{err:?}")
-                    });
-
+                return Task::perform(remove_patch(state.path.to_path_buf()), |result| {
+                    let result = result.map_err(|err| format!("{err:?}"));
                     PatchMessage::Removed(result)
                 });
             }
             PatchMessage::Added(result) => {
                 if let Err(err) = result {
+                    error!("failed to apply patch: {err}");
                     state.alter_patch_state = AlterPatchState::Error(err);
                 } else {
                     state.alter_patch_state = AlterPatchState::Success;
@@ -706,6 +705,7 @@ impl App {
             }
             PatchMessage::Removed(result) => {
                 if let Err(err) = result {
+                    error!("failed to remove patch: {err}");
                     state.alter_patch_state = AlterPatchState::Error(err);
                 } else {
                     state.alter_patch_state = AlterPatchState::Success;
@@ -739,33 +739,24 @@ impl App {
 
                 state.alter_plugin_state = AlterPluginState::Loading;
 
-                return Task::perform(
-                    async move { apply_plugin(&path, &release).await },
-                    |result| {
-                        let result = result.map_err(|err| {
-                            error!("failed to add plugin: {err:?}");
-                            format!("{err:?}")
-                        });
-
-                        PluginMessage::Added(result)
-                    },
-                );
+                return Task::perform(apply_plugin(path, release), |result| {
+                    let result = result.map_err(|err| format!("{err:?}"));
+                    PluginMessage::Added(result)
+                });
             }
             PluginMessage::Remove => {
                 let path = state.path.to_path_buf();
 
                 state.alter_plugin_state = AlterPluginState::Loading;
 
-                return Task::perform(async move { remove_plugin(&path).await }, |result| {
-                    let result = result.map_err(|err| {
-                        error!("failed to remove plugin: {err:?}");
-                        format!("{err:?}")
-                    });
+                return Task::perform(remove_plugin(path), |result| {
+                    let result = result.map_err(|err| format!("{err:?}"));
                     PluginMessage::Removed(result)
                 });
             }
             PluginMessage::Added(result) => {
                 if let Err(err) = result {
+                    error!("failed to add plugin: {err:?}");
                     state.alter_plugin_state = AlterPluginState::Error(err);
                 } else {
                     state.alter_plugin_state = AlterPluginState::Success;
@@ -774,6 +765,7 @@ impl App {
             }
             PluginMessage::Removed(result) => {
                 if let Err(err) = result {
+                    error!("failed to remove plugin: {err:?}");
                     state.alter_plugin_state = AlterPluginState::Error(err);
                 } else {
                     state.alter_plugin_state = AlterPluginState::Success;
