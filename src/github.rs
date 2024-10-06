@@ -6,7 +6,7 @@ use reqwest::header;
 use serde::Deserialize;
 
 /// Structure for the required portions of github releases
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct GitHubRelease {
     /// The URL for viewing the release in the browser
     pub html_url: String,
@@ -21,7 +21,7 @@ pub struct GitHubRelease {
 }
 
 /// Represents an asset from github releases that can be downloaded
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct GitHubReleaseAsset {
     /// The name of the file
     pub name: String,

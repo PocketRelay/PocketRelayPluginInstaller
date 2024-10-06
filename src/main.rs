@@ -8,6 +8,9 @@ mod github;
 mod iced;
 mod ui;
 
+mod bink;
+mod plugin;
+
 /// Application crate version string
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
