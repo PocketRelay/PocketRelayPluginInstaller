@@ -4,9 +4,9 @@
 )]
 #![warn(unused_crate_dependencies)]
 
+mod app;
 mod bink;
 mod github;
-mod iced;
 mod plugin;
 
 /// Application crate version string
@@ -19,5 +19,5 @@ fn main() {
         .init();
 
     // Initialize the UI
-    iced::init();
+    app::init();
 }
