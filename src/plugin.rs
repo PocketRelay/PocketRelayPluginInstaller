@@ -79,6 +79,14 @@ pub async fn apply_plugin(game_path: PathBuf, release: GitHubRelease) -> anyhow:
         .await
         .context("failed to download client plugin")?;
 
+    if let Some(parent) = plugin_path.parent() {
+        if !parent.exists() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("failed to create required plugins directory")?;
+        }
+    }
+
     // Save the plugin to the plugins directory
     tokio::fs::write(plugin_path, bytes)
         .await
